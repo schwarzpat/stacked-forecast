@@ -1,0 +1,169 @@
+# 01 FEATURE ENGINEERING
+library(tidyverse)  # loading dplyr, tibble, ggplot2, .. dependencies
+library(timetk)  # using timetk plotting, diagnostics and augment operations
+library(tsibble)  # for month to Date conversion
+library(tsibbledata)  # for aus_retail dataset
+library(fastDummies)  # for dummyfying categorical variables
+library(skimr) # for quick statistics
+
+# 02 FEATURE ENGINEERING WITH RECIPES
+library(tidymodels) # with workflow dependency
+
+# 03 MACHINE LEARNING
+library(modeltime) # ML models specifications and engines
+library(tictoc) # measure training elapsed time
+
+# 04 HYPERPARAMETER TUNING
+library(future)
+library(doFuture)
+library(plotly)
+
+# 05 ENSEMBLES
+library(modeltime.ensemble)
+
+# 06 DATA
+aus_retail_tbl <- aus_retail %>%
+     tk_tbl()
+
+monthly_retail_tbl <- aus_retail_tbl %>%
+     filter(State == "Australian Capital Territory") %>%
+     mutate(Month = as.Date(Month)) %>%
+     mutate(Industry = as_factor(Industry)) %>%
+     select(Month, Industry, Turnover)
+
+monthly_retail_tbl %>% glimpse()
+
+groups <- lapply(X = 1:length(Industries), FUN = function(x){
+
+  monthly_retail_tbl %>%
+    filter(Industry == Industries[x]) %>%
+    arrange(Month) %>%
+    mutate(Turnover =  log1p(x = Turnover)) %>%
+    mutate(Turnover =  standardize_vec(Turnover)) %>%
+    future_frame(Month, .length_out = "12 months", .bind_data = TRUE) %>%
+    mutate(Industry = Industries[x]) %>%
+    tk_augment_fourier(.date_var = Month, .periods = 12, .K = 1) %>%
+    tk_augment_lags(.value = Turnover, .lags = 12) %>%
+    tk_augment_slidify(.value   = Turnover_lag12,
+                       .f       = ~ mean(.x, na.rm = TRUE), 
+                       .period  = c(3, 6, 9, 12),
+                       .partial = TRUE,
+                       .align   = "center")
+})
+
+groups_fe_tbl <- bind_rows(groups) %>%
+  rowid_to_column(var = "rowid")
+
+groups_fe_tbl %>% tail(n=13) %>% glimpse()
+
+tmp <- monthly_retail_tbl %>%
+  group_by(Industry) %>% 
+  arrange(Month) %>%
+  mutate(Turnover = log1p(x = Turnover)) %>% 
+  group_map(~ c(mean = mean(.x$Turnover, na.rm = TRUE),
+                sd = sd(.x$Turnover, na.rm = TRUE))) %>% 
+  bind_rows()
+
+std_mean <- tmp$mean
+std_sd <- tmp$sd
+rm('tmp')
+
+# 07 SPLIT
+
+data_prepared_tbl <- groups_fe_tbl %>%
+    filter(!is.na(Turnover)) %>%
+    drop_na()
+
+data_prepared_tbl %>% glimpse()
+
+future_tbl <- groups_fe_tbl %>%
+    filter(is.na(Turnover))
+
+future_tbl %>% head(n=12) %>% glimpse()
+
+splits <- data_prepared_tbl %>%
+    time_series_split(Month, 
+                      assess = "86 months", 
+                      cumulative = TRUE)
+
+split object
+
+splits
+
+splits %>%
+   tk_time_series_cv_plan() %>% glimpse()
+
+splits %>%
+   tk_time_series_cv_plan() %>% select(.id) %>% table()
+   
+Slice1 
+
+splits %>%
+   tk_time_series_cv_plan() %>% select(.key) %>% table()
+   
+Industries <- unique(aus_retail_tbl$Industry)
+
+splits %>%
+  tk_time_series_cv_plan() %>%
+  filter(Industry == Industries[1]) %>%
+  plot_time_series_cv_plan(.date_var = Month, 
+                           .value = Turnover, 
+                           .title = paste0("Split for ", industry))
+                
+training(splits) %>% 
+     filter(Industry == Industries[industry]) %>% 
+     glimpse()
+     
+# 08 RECIPE
+
+recipe_spec <- recipe(Turnover ~ ., data = training(splits)) %>%
+  update_role(rowid, new_role = "indicator") %>%  
+  step_other(Industry) %>%
+  step_timeseries_signature(Month) %>%
+  step_rm(matches("(.xts$)|(.iso$)|(hour)|(minute)|(second)|(day)|(week)|(am.pm)")) %>%
+  step_dummy(all_nominal(), one_hot = TRUE) %>%
+  step_normalize(Month_index.num, Month_year)
+
+# Extracted training dataset
+recipe_spec %>% 
+   prep() %>%
+   juice() %>% 
+   glimpse()
+
+# 09 SAVE RECIPE
+
+feature_engineering_artifacts_list <- list(
+  # Data
+  data = list(
+    data_prepared_tbl = data_prepared_tbl,
+    future_tbl      = future_tbl,
+    industries = Industries
+  ),
+
+  # Recipes
+  recipes = list(
+    recipe_spec = recipe_spec
+  ),
+
+  # Splits
+  splits = splits,
+
+  # Inversion Parameters
+  standardize = list(
+    std_mean = std_mean,
+    std_sd   = std_sd
+  ),
+
+  normalize = list(
+    Month_index.num_limit_lower = Month_index.num_limit_lower, 
+    Month_index.num_limit_upper = Month_index.num_limit_upper,
+    Month_year_limit_lower = Month_year_limit_lower,
+    Month_year_limit_upper = Month_year_limit_upper
+  )  
+)
+
+feature_engineering_artifacts_list %>% 
+  write_rds("feature_engineering_artifacts_list.rds")
+
+
+
